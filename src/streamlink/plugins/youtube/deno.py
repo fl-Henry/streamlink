@@ -2,11 +2,47 @@ import json
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass, field
+from enum import Enum
 
 import requests
 
 from . import solver
-from .utils import JsChallengeRequest, NChallengeOutput, JsChallengeResponse
+
+
+class JsChallengeType(Enum):
+    N = 'n'
+
+
+@dataclass(frozen=True)
+class NChallengeInput:
+    player_url: str
+    challenge: str
+
+
+@dataclass(frozen=True)
+class JsChallengeRequest:
+    type: JsChallengeType
+    input: NChallengeInput
+    video_id: str | None = None
+
+
+@dataclass(frozen=True)
+class NChallengeOutput:
+    results: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class JsChallengeResponse:
+    type: JsChallengeType
+    output: NChallengeOutput
+
+
+@dataclass
+class JsChallengeProviderResponse:
+    request: JsChallengeRequest
+    response: JsChallengeResponse | None = None
+    error: Exception | None = None
 
 
 class DenoJCP:
@@ -88,8 +124,8 @@ class DenoJCP:
 
     def _get_player(self, player_url):
         if player_url not in self._code_cache:
+            # player_url = 'https://www.youtube.com/s/player/9f4cc5e4/tv-player-ias.vflset/tv-player-ias.js'
             code = requests.get(player_url).text
-            print("Requested:", player_url)
             if code:
                 self._code_cache[player_url] = code
         return self._code_cache.get(player_url)

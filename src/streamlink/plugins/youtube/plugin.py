@@ -2,9 +2,10 @@ import re
 from urllib.parse import urlparse, urlunparse
 
 from streamlink.plugin import Plugin, pluginmatcher
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
+from .deno import DenoJCP
 
-from .extractors import VideoExtractor, TabExtractor, Extractor, ExtractorResponse, ctx
+from .extractors import VideoExtractor, TabExtractor, Extractor, ExtractorResult, ctx
 
 
 @pluginmatcher(
@@ -53,18 +54,21 @@ class Youtube(Plugin):
         elif parsed.scheme != "https":
             self.url = urlunparse(parsed._replace(scheme="https"))
 
-    def _extract_info(self, prev: ExtractorResponse = None):
-        if not prev:
+    def _next_extract(self, prev_result: ExtractorResult = None):
+        print(f'{prev_result=}')
+
+        # Define extractor and url based on previous result or current url
+        if not prev_result:
             extractor = next((e for e in self._EXTRACTORS if re.match(e.valid_url_re, self.url)), None)
             url = self.url
-        elif prev.hls:
-            return prev.hls
+        elif prev_result.hls:
+            return prev_result.hls
         else:
-            extractor = next((e for e in self._EXTRACTORS if e.extractor_type == prev.next.extractor))
-            url = prev.next.url
+            extractor = next((e for e in self._EXTRACTORS if e.extractor_type == prev_result.next.extractor))
+            url = prev_result.next.url
 
         extractor_result = extractor().extract(url)
-        return self._extract_info(prev=extractor_result)
+        return self._next_extract(prev_result=extractor_result)
 
     def _get_streams(self):
         """Find a stream URL list and yield it as an iterator.
@@ -72,12 +76,9 @@ class Youtube(Plugin):
         :return: tuple[str, HLSStream]
         """
 
-        print("here")
         ctx.session = self.session
-        print(f"{id(self.session)=}")
-        print(f"{id(ctx.session)=}")
-
-        m3u8_urls = self._extract_info()
+        ctx.deno = DenoJCP()
+        m3u8_urls = self._next_extract()
 
         # Yield HLSStream
         for m3u8_url in m3u8_urls.__reversed__():

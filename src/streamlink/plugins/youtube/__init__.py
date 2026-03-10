@@ -1,3 +1,3 @@
-from youtube.plugin import Youtube
+from .plugin import Youtube
 
 __plugin__ = Youtube
