@@ -10,7 +10,7 @@ import logging
 import re
 from urllib.parse import urlparse
 
-from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin import Plugin, pluginmatcher, pluginargument
 from streamlink.stream.hls import HLSStream
 from .deno import DenoJCP
 from .structures import Extractor, ExtractorResult, ctx
@@ -43,6 +43,16 @@ log = logging.getLogger(__name__)
     pattern=re.compile(
         r"https?://youtu\.be/(?P<video_id>[\w-]{11})",
     ),
+)
+@pluginargument(
+    "stream",
+    default="first",
+    metavar="ORDER",
+    help="""
+        Select which stream to play when opening a channel page or /streams listing.
+        Can be ``first``, ``last``, ``popular``, or a position number (e.g. ``1``, ``2``, ``3``).
+        Defaults to ``first``.
+    """,
 )
 class Youtube(Plugin):
     """Streamlink plugin for YouTube. Resolves live and VOD streams via an extractor chain."""
@@ -98,6 +108,10 @@ class Youtube(Plugin):
             extractor = next((e for e in self._EXTRACTORS if e.extractor_type == prev_result.next.extractor))
             url = prev_result.next.url
 
+        if not extractor:
+            log.warning(f"No extractor found for URL: {self.url}")
+            return []
+
         log.debug(f"Chaining to {extractor.__name__} for {url}")
         return self._next_extract(prev_result=extractor().extract(url))
 
@@ -107,9 +121,10 @@ class Youtube(Plugin):
         Args:
             urls: HLS manifest URLs to probe
 
-        Yields:
-            tuple[str, HLSStream]: Stream quality name and HLS stream object
+        Returns:
+            list[tuple[str, HLSStream]]: Stream quality name to HLS stream object mapping
         """
+        streams = []
         for m3u8_url in urls:
             try:
                 variant_playlist = HLSStream.parse_variant_playlist(self.session, m3u8_url)
@@ -117,9 +132,13 @@ class Youtube(Plugin):
                 with v.open() as fd:
                     fd.timeout = 2
                     fd.read(64)
-                yield from variant_playlist.items()
+                streams.extend(variant_playlist.items())
             except Exception as e:
                 log.warning(f"Skipping unreachable stream {m3u8_url}: {e}")
+
+        if not streams:
+            raise ValueError("No playable streams returned by extractors")
+        return streams
 
     def _get_streams(self):
         """Extract and yield HLS streams from YouTube.
@@ -127,9 +146,12 @@ class Youtube(Plugin):
         Yields:
             tuple[str, HLSStream]: Stream quality name and HLS stream object
         """
+
+        print(self.options.get("stream"))
         try:
             # Extract HLS manifest URLs through extractor chain
-            yield from self._check_streams(self._next_extract())
+            m3u8_urls = self._next_extract()
+            yield from self._check_streams(m3u8_urls)
 
         except Exception as e:
             log.error(f"Extraction failed: {e}")
