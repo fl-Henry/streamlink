@@ -16,7 +16,7 @@ from requests import Response
 from streamlink.plugin.api import validate
 from streamlink.utils.parse import parse_json
 
-from .structures import NChallengeInput, ExtractorType, ExtractorResult, NextExtractor, ctx
+from .structures import NChallengeInput, ExtractorType, ExtractorResult, NextExtractor, StreamSelection, ctx, StreamPick
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +52,11 @@ CLIENTS = {
     },
 }
 
+_re_ytInitialData = re.compile(
+    r"""var\s+ytInitialData\s*=\s*({.*?})\s*;\s*</script>""",
+    re.DOTALL,
+)
+
 
 def _get_data_from_regex(res: Response, regex, descr: str):
     """Search *res.text* with *regex* and parse the first capture group as JSON.
@@ -69,7 +74,148 @@ def _get_data_from_regex(res: Response, regex, descr: str):
     log.debug("Pattern not found in response body: %s", descr)
 
 
-class TabExtractor:
+class StreamsExtractor:
+    """Resolves a YouTube ``/streams`` page to a watch URL.
+
+    Fetches the channel streams page, extracts ``ytInitialData``, filters
+    active (non-upcoming) streams, and redirects to the selected video.
+    """
+
+    valid_url_re = r"https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\\#&]+)/streams"
+    extractor_type: ExtractorType = ExtractorType.LIVE
+
+    @staticmethod
+    def _get_initial_data(url) -> dict:
+        """Fetch and return ``ytInitialData`` from *url*, retrying up to 3 times.
+
+        Args:
+            url: Channel streams page URL.
+
+        Returns:
+            Parsed ``ytInitialData`` dict, or ``{}`` if all attempts fail.
+        """
+        for attempt in range(1, 4):
+            try:
+                log.debug("Fetching ytInitialData (attempt %d): %s", attempt, url)
+                webpage = ctx.session.http.get(url)
+                return _get_data_from_regex(webpage, _re_ytInitialData, "ytInitialData")
+            except Exception as exc:
+                log.error("Error fetching ytInitialData (attempt %d): %s", attempt, exc)
+        log.warning("All attempts to fetch ytInitialData failed for: %s", url)
+        return {}
+
+    @staticmethod
+    def _schema_tab_data(data) -> dict | None:
+        """Extract the contents list from the currently selected tab.
+
+        Navigates ``ytInitialData`` to find the active ``richGridRenderer``
+        tab and returns its ``contents`` list.
+
+        Args:
+            data: Parsed ``ytInitialData`` dict.
+
+        Returns:
+            The ``contents`` list of the selected tab, or ``None`` if not found.
+        """
+        return validate.Schema(
+            {"contents": {"twoColumnBrowseResultsRenderer": {"tabs": list}}},
+            validate.get(("contents", "twoColumnBrowseResultsRenderer", "tabs")),
+            validate.filter(lambda tab: (
+                tab.get("tabRenderer", {}).get("selected")
+                and tab.get("tabRenderer", {}).get("content", {}).get("richGridRenderer", {}).get("contents")
+            )),
+            validate.get((0, "tabRenderer", "content", "richGridRenderer", "contents")),
+        ).validate(data)
+
+    @staticmethod
+    def _schema_active_streams(data) -> list[tuple] | None:
+        """Extract active (non-upcoming) video IDs and their viewer count runs.
+
+        Skips non-video items (e.g. ``continuationItemRenderer``) and videos
+        with ``upcomingEventData`` (scheduled but not yet live).
+
+        Args:
+            data: Raw ``richGridRenderer.contents`` list from ``ytInitialData``.
+
+        Returns:
+            List of ``(videoId, runs)`` tuples, where ``runs`` is the ``viewCountText.runs`` list.
+        """
+        return validate.Schema(
+            [
+                validate.any(
+                    validate.all(
+                        {"richItemRenderer": {"content": {"videoRenderer": dict}}},
+                        validate.get(("richItemRenderer", "content", "videoRenderer")),
+                    ),
+                    validate.transform(lambda _: None),
+                )
+            ],
+            validate.filter(None.__ne__),
+            # Keep only active streams: must have a viewer count and not be scheduled
+            validate.filter(lambda v: v.get("viewCountText", {}).get("runs") and not v.get("upcomingEventData")),
+            validate.map(lambda v: (v["videoId"], v["viewCountText"]["runs"])),
+        ).validate(data)
+
+    @staticmethod
+    def _pick_stream(active_streams) -> str:
+        """Select a video ID from *active_streams* according to the ``stream`` plugin option.
+
+        Args:
+            active_streams: List of ``(videoId, runs)`` tuples as returned by
+                :meth:`_schema_active_streams`.
+
+        Returns:
+            The selected video ID string.
+        """
+        stream_pick = StreamSelection(ctx.options.get("stream")).value
+        log.debug("Stream pick option: %r, %d candidate(s)", stream_pick, len(active_streams))
+
+        if isinstance(stream_pick, int):
+            # Clamp to last if position exceeds available streams
+            index = min(stream_pick - 1, len(active_streams) - 1)
+            video_id = active_streams[index][0]
+        elif stream_pick == StreamPick.FIRST:
+            video_id = active_streams[0][0]
+        elif stream_pick == StreamPick.LAST:
+            video_id = active_streams[-1][0]
+        else:
+            # StreamPick.POPULAR: rank by viewer count, pick the highest
+            # Clean /runs/.../text from non-digits and get first number for every stream
+            ranked = [
+                (vid, int(re.sub(r"\D", "", next(r["text"] for r in runs if re.search(r"\d", r["text"])))))
+                for vid, runs in active_streams
+            ]
+            video_id = max(ranked, key=lambda x: x[1])[0]
+
+        log.debug("Selected video ID: %s", video_id)
+        return video_id
+
+    def extract(self, url: str) -> ExtractorResult:
+        """Extract the selected live video ID from a ``/streams`` page and redirect.
+
+        Args:
+            url: YouTube channel streams URL.
+
+        Returns:
+            :class:`ExtractorResult` with ``next`` set to a
+            :class:`NextExtractor` pointing at the watch URL.
+        """
+        initial = self._get_initial_data(url)
+        tab_data = self._schema_tab_data(initial)
+        active_streams = self._schema_active_streams(tab_data)
+        log.debug("Active streams found: %d", len(active_streams) if active_streams else 0)
+        video_id = self._pick_stream(active_streams)
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        log.debug("Redirecting to: %s", watch_url)
+        return ExtractorResult(
+            next=NextExtractor(
+                extractor=ExtractorType.VIDEO,
+                url=watch_url,
+            )
+        )
+
+
+class LiveExtractor:
     """Resolves a YouTube channel/live URL to a watch URL.
 
     Fetches the channel page, extracts ``ytInitialData``, and returns a
@@ -77,12 +223,34 @@ class TabExtractor:
     """
 
     valid_url_re = r"https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\\#&]+)/live"
-    extractor_type: ExtractorType = ExtractorType.TAB
+    extractor_type: ExtractorType = ExtractorType.LIVE
 
-    _re_ytInitialData = re.compile(
-        r"""var\s+ytInitialData\s*=\s*({.*?})\s*;\s*</script>""",
-        re.DOTALL,
-    )
+    @staticmethod
+    def _get_initial_data(url) -> dict:
+        """Fetch and return ``ytInitialData`` from *url*, retrying up to 3 times.
+
+        YouTube occasionally returns a page without ``currentVideoEndpoint``,
+        so each attempt checks for that key before accepting the result.
+
+        Args:
+            url: Channel live page URL.
+
+        Returns:
+            Parsed ``ytInitialData`` dict, or ``{}`` if all attempts fail.
+        """
+        for attempt in range(1, 4):
+            try:
+                log.debug("Fetching ytInitialData (attempt %d): %s", attempt, url)
+                webpage = ctx.session.http.get(url)
+                initial = _get_data_from_regex(webpage, _re_ytInitialData, "ytInitialData")
+                if initial and initial.get("currentVideoEndpoint"):
+                    log.debug("ytInitialData obtained on attempt %d", attempt)
+                    return initial
+                log.debug("ytInitialData missing currentVideoEndpoint on attempt %d", attempt)
+            except Exception as exc:
+                log.error("Error fetching ytInitialData (attempt %d): %s", attempt, exc)
+        log.warning("All attempts to fetch ytInitialData failed for: %s", url)
+        return {}
 
     @staticmethod
     def _schema_video_id(data) -> str | None:
@@ -102,32 +270,6 @@ class TabExtractor:
             },
             validate.get(("currentVideoEndpoint", "watchEndpoint", "videoId")),
         ).validate(data)
-
-    def _get_initial_data(self, url: str) -> dict:
-        """Fetch and return ``ytInitialData`` from *url*, retrying up to 3 times.
-
-        YouTube occasionally returns a page without ``currentVideoEndpoint``,
-        so each attempt checks for that key before accepting the result.
-
-        Args:
-            url: Channel live page URL.
-
-        Returns:
-            Parsed ``ytInitialData`` dict, or ``{}`` if all attempts fail.
-        """
-        for attempt in range(1, 4):
-            try:
-                log.debug("Fetching ytInitialData (attempt %d/3): %s", attempt, url)
-                webpage = ctx.session.http.get(url)
-                initial = _get_data_from_regex(webpage, self._re_ytInitialData, "ytInitialData")
-                if initial and initial.get("currentVideoEndpoint"):
-                    log.debug("ytInitialData obtained on attempt %d", attempt)
-                    return initial
-                log.debug("ytInitialData missing currentVideoEndpoint on attempt %d", attempt)
-            except Exception as exc:
-                log.error("Error fetching ytInitialData (attempt %d/3): %s", attempt, exc)
-        log.warning("All attempts to fetch ytInitialData failed for: %s", url)
-        return {}
 
     def extract(self, url: str) -> ExtractorResult:
         """Extract the live video ID from a channel/live page and redirect.
@@ -154,7 +296,7 @@ class TabExtractor:
                     url=watch_url
                 )
             )
-        raise ValueError("Unable to extract video ID from tab page")
+        raise ValueError("Unable to extract video ID from /live page")
 
 
 class VideoExtractor:
@@ -235,7 +377,7 @@ class VideoExtractor:
             "playbackContext": {
                 "contentPlaybackContext": {
                     "html5Preference": "HTML5_PREF_WANTS",
-                    **( {"signatureTimestamp": sts} if (sts := webpage_ytcfg.get("STS")) else {}),
+                    **({"signatureTimestamp": sts} if (sts := webpage_ytcfg.get("STS")) else {}),
                 },
             },
             "contentCheckOk": True,
@@ -431,20 +573,20 @@ class VideoExtractor:
         for attempt in range(1, 4):
             time.sleep(1)
             self.video_id = re.search(self.valid_url_re, url).group("id")
-            log.debug("VideoExtractor.extract attempt %d/3 — video_id: %s", attempt, self.video_id)
+            log.debug("VideoExtractor.extract attempt %d — video_id: %s", attempt, self.video_id)
 
             webpage_ytcfg = self._get_webpage_data(url)
 
             try:
                 player_responses, player_url = self._extract_player_responses(webpage_ytcfg)
             except ValueError as exc:
-                log.error("Player response extraction failed (attempt %d/3): %s", attempt, exc)
+                log.error("Player response extraction failed (attempt %d): %s", attempt, exc)
                 continue
 
             hls = self._extract_hls(player_responses, player_url)
             if hls:
                 log.debug("HLS extraction succeeded")
                 break
-            log.warning("No HLS URLs on attempt %d/3, retrying", attempt)
+            log.warning("No HLS URLs on attempt %d, retrying", attempt)
 
         return ExtractorResult(hls=hls)

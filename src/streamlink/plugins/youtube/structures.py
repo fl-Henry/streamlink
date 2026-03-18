@@ -3,11 +3,50 @@
 Defines n-challenge I/O types, extractor result types, protocols,
 and the module-level runtime context shared across extractors and JS solvers.
 """
+import logging
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import Protocol
 
+from streamlink.options import Options
 from streamlink.session.session import Streamlink
+
+log = logging.getLogger(__name__)
+
+
+class StreamPick(StrEnum):
+    """Named ordering options for stream selection."""
+    FIRST = auto()
+    LAST = auto()
+    POPULAR = auto()
+
+    @classmethod
+    def metavar(cls) -> str:
+        return "|".join(v.value for v in cls) + "|N"
+
+
+@dataclass(frozen=True)
+class StreamSelection:
+    """Represents a stream selection option from the /streams page.
+
+    Can be ``first``, ``last``, ``popular``, or a 1-based position number.
+
+    Args:
+        value: A :class:`StreamPick` value, or a positive :class:`int` position.
+    """
+    value: StreamPick | int
+
+    def __post_init__(self):
+        try:
+            if isinstance(self.value, str) and self.value.isdigit():
+                object.__setattr__(self, "value", int(self.value))
+            elif isinstance(self.value, str):
+                object.__setattr__(self, "value", StreamPick(self.value))
+            if isinstance(self.value, int) and self.value < 1:
+                raise ValueError()
+        except ValueError:
+            log.warning("Invalid stream selection option %r, defaulting to %r", self.value, StreamPick.POPULAR.value)
+            object.__setattr__(self, "value", StreamPick.POPULAR)
 
 
 @dataclass(frozen=True)
@@ -35,7 +74,8 @@ class NChallengeOutput:
 class ExtractorType(StrEnum):
     """Discriminator for the YouTube Extractors."""
     VIDEO = auto()  # youtube.com/watch?v=<id>
-    TAB = auto()  # youtube.com/@handle/live, /channel/<id>/live, etc.
+    LIVE = auto()  # youtube.com/@handle/live, /channel/<id>/live, etc.
+    STREAMS = auto()  # youtube.com/@handle/streams, /channel/<id>/streams, etc.
 
 
 @dataclass(frozen=True)
@@ -109,6 +149,7 @@ class Context:
         deno:    JS solver instance (e.g. Deno-backed) for n-challenges.
     """
     session: Streamlink = None
+    options: Options = None
     deno: JsSolver = None
 
 

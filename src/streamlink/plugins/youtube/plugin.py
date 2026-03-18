@@ -13,8 +13,8 @@ from urllib.parse import urlparse
 from streamlink.plugin import Plugin, pluginmatcher, pluginargument
 from streamlink.stream.hls import HLSStream
 from .deno import DenoJCP
-from .structures import Extractor, ExtractorResult, ctx
-from .extractors import VideoExtractor, TabExtractor
+from .structures import Extractor, ExtractorResult, ctx, StreamPick
+from .extractors import VideoExtractor, LiveExtractor, StreamsExtractor
 from .youtube_original import YouTube as YtOriginal
 
 log = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 @pluginmatcher(
     name="channel",
     pattern=re.compile(
-        r"https?://(?:\w+\.)?youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<channel>[^/?]+)(?P<live>/live)?/?$",
+        r"https?://(?:\w+\.)?youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<channel>[^/?]+)(?P<tab>/(?:live|streams))?/?$",
     ),
 )
 @pluginmatcher(
@@ -46,18 +46,18 @@ log = logging.getLogger(__name__)
 )
 @pluginargument(
     "stream",
-    default="first",
-    metavar="ORDER",
+    default="popular",
+    metavar=StreamPick.metavar(),
     help="""
         Select which stream to play when opening a channel page or /streams listing.
-        Can be ``first``, ``last``, ``popular``, or a position number (e.g. ``1``, ``2``, ``3``).
-        Defaults to ``first``.
+        Can be `first`, `last`, `popular`, or a position number of the active stream (e.g. `1`, `2`, `3`).
+        Defaults to `popular`.
     """,
 )
 class Youtube(Plugin):
     """Streamlink plugin for YouTube. Resolves live and VOD streams via an extractor chain."""
 
-    _EXTRACTORS: list[type[Extractor]] = [VideoExtractor, TabExtractor]
+    _EXTRACTORS: list[type[Extractor]] = [VideoExtractor, LiveExtractor, StreamsExtractor]
 
     _url_canonical: str = "https://www.youtube.com/watch?v={video_id}"
     _url_channelid_live: str = "https://www.youtube.com/channel/{channel_id}/live"
@@ -67,6 +67,7 @@ class Youtube(Plugin):
         self.url = self._normalize_url()
         log.debug(f"Normalized URL: {self.url}")
         ctx.session = self.session
+        ctx.options = self.options
         ctx.deno = DenoJCP()
 
     def _normalize_url(self) -> str:
@@ -81,6 +82,8 @@ class Youtube(Plugin):
             return self._url_canonical.format(video_id=self.match["video_id"])
         elif self.matches["embed"] and self.match["live"]:
             return self._url_channelid_live.format(channel_id=self.match["live"])
+        elif self.matches["channel"] and not self.match["tab"]:
+            return self.url.rstrip("/") + "/streams"
         elif parsed.scheme != "https":
             return parsed._replace(scheme="https").geturl()
         return self.url
@@ -147,7 +150,6 @@ class Youtube(Plugin):
             tuple[str, HLSStream]: Stream quality name and HLS stream object
         """
 
-        print(self.options.get("stream"))
         try:
             # Extract HLS manifest URLs through extractor chain
             m3u8_urls = self._next_extract()
@@ -156,4 +158,5 @@ class Youtube(Plugin):
         except Exception as e:
             log.error(f"Extraction failed: {e}")
             log.info("Falling back to original YouTube plugin")
+            self.url = self.url.removesuffix("/streams")
             yield from YtOriginal(self.session, self.url, self.options)._get_streams().items()
