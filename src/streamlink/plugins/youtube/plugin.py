@@ -1,11 +1,23 @@
+"""YouTube plugin for Streamlink.
+
+Supported URL formats:
+  youtube.com/watch?v=VIDEO_ID  youtube.com/v/VIDEO_ID  youtube.com/live/VIDEO_ID
+  youtu.be/VIDEO_ID             youtube.com/embed/VIDEO_ID
+  youtube.com/@channel/live     gaming.youtube.com/...
+"""
+
+import logging
 import re
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.stream.hls import HLSStream
 from .deno import DenoJCP
+from .structures import Extractor, ExtractorResult, ctx
+from .extractors import VideoExtractor, TabExtractor
+from .youtube_original import YouTube as YtOriginal
 
-from .extractors import VideoExtractor, TabExtractor, Extractor, ExtractorResult, ctx
+log = logging.getLogger(__name__)
 
 
 @pluginmatcher(
@@ -33,53 +45,88 @@ from .extractors import VideoExtractor, TabExtractor, Extractor, ExtractorResult
     ),
 )
 class Youtube(Plugin):
+    """Streamlink plugin for YouTube. Resolves live and VOD streams via an extractor chain."""
+
     _EXTRACTORS: list[type[Extractor]] = [VideoExtractor, TabExtractor]
 
-    _url_canonical = "https://www.youtube.com/watch?v={video_id}"
-    _url_channelid_live = "https://www.youtube.com/channel/{channel_id}/live"
+    _url_canonical: str = "https://www.youtube.com/watch?v={video_id}"
+    _url_channelid_live: str = "https://www.youtube.com/channel/{channel_id}/live"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.url = self._normalize_url()
+        log.debug(f"Normalized URL: {self.url}")
+        ctx.session = self.session
+        ctx.deno = DenoJCP()
+
+    def _normalize_url(self) -> str:
+        """Normalize various YouTube URL formats to a canonical HTTPS URL."""
         parsed = urlparse(self.url)
 
-        # translate input URLs to be able to find embedded data and to avoid unnecessary HTTP redirects
         if parsed.netloc == "gaming.youtube.com":
-            self.url = urlunparse(parsed._replace(scheme="https", netloc="www.youtube.com"))
+            return parsed._replace(scheme="https", netloc="www.youtube.com").geturl()
         elif self.matches["shorthand"]:
-            self.url = self._url_canonical.format(video_id=self.match["video_id"])
+            return self._url_canonical.format(video_id=self.match["video_id"])
         elif self.matches["embed"] and self.match["video_id"]:
-            self.url = self._url_canonical.format(video_id=self.match["video_id"])
+            return self._url_canonical.format(video_id=self.match["video_id"])
         elif self.matches["embed"] and self.match["live"]:
-            self.url = self._url_channelid_live.format(channel_id=self.match["live"])
+            return self._url_channelid_live.format(channel_id=self.match["live"])
         elif parsed.scheme != "https":
-            self.url = urlunparse(parsed._replace(scheme="https"))
+            return parsed._replace(scheme="https").geturl()
+        return self.url
 
     def _next_extract(self, prev_result: ExtractorResult = None):
-        print(f'{prev_result=}')
+        """Recursively extract stream data through extractor chain.
 
-        # Define extractor and url based on previous result or current url
+        YouTube extraction may require multiple steps:
+        1. TabExtractor: Channel/live pages -> video URL
+        2. VideoExtractor: Video page -> HLS manifest URLs
+
+        Args:
+            prev_result: Result from previous extraction step
+
+        Returns:
+            list[str]: HLS manifest URLs
+        """
         if not prev_result:
             extractor = next((e for e in self._EXTRACTORS if re.match(e.valid_url_re, self.url)), None)
             url = self.url
         elif prev_result.hls:
+            log.debug(f"Resolved {len(prev_result.hls)} HLS manifest(s)")
             return prev_result.hls
         else:
             extractor = next((e for e in self._EXTRACTORS if e.extractor_type == prev_result.next.extractor))
             url = prev_result.next.url
 
-        extractor_result = extractor().extract(url)
-        return self._next_extract(prev_result=extractor_result)
+        log.debug(f"Chaining to {extractor.__name__} for {url}")
+        return self._next_extract(prev_result=extractor().extract(url))
+
+    def _check_streams(self, urls):
+        """Parse and probe HLS variant playlists, discarding unreachable streams."""
+        playlist = []
+        for m3u8_url in urls:
+            try:
+                for k, v in HLSStream.parse_variant_playlist(self.session, m3u8_url).items():
+                    with v.open() as fd:
+                        fd.timeout = 2
+                        fd.read(64)
+                    playlist.append((k, v))
+            except Exception as e:
+                log.warning(f"Skipping unreachable stream {m3u8_url}: {e}")
+        print(f'{playlist=}')
+        return playlist
 
     def _get_streams(self):
-        """Find a stream URL list and yield it as an iterator.
+        """Extract and yield HLS streams from YouTube.
 
-        :return: tuple[str, HLSStream]
-        """
+                Yields:
+                    tuple[str, HLSStream]: Stream quality name and HLS stream object
+                """
+        try:
+            # Extract HLS manifest URLs through extractor chain
+            yield from self._check_streams(self._next_extract())
 
-        ctx.session = self.session
-        ctx.deno = DenoJCP()
-        m3u8_urls = self._next_extract()
-
-        # Yield HLSStream
-        for m3u8_url in m3u8_urls.__reversed__():
-            yield from HLSStream.parse_variant_playlist(self.session, m3u8_url).items()
+        except Exception as e:
+            log.error(f"Extraction failed: {e}")
+            log.info("Falling back to original YouTube plugin")
+            yield from YtOriginal(self.session, self.url, self.options)._get_streams().items()
