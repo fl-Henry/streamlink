@@ -1,4 +1,4 @@
-"""YouTube data extractors for video and channel pages.
+"""YouTube data extractors for video and channel/live pages.
 
 Provides extractors that handle:
 - Tab pages (channel/live pages) -> video URLs
@@ -11,319 +11,440 @@ import re
 import time
 from urllib.parse import urlparse, urlunparse
 
-import requests
 from requests import Response
 
 from streamlink.plugin.api import validate
 from streamlink.utils.parse import parse_json
 
-from .structures import JsChallengeRequest, JsChallengeType, NChallengeInput, ExtractorType, ExtractorResult, NextExtractor, ctx
+from .structures import NChallengeInput, ExtractorType, ExtractorResult, NextExtractor, ctx
 
 log = logging.getLogger(__name__)
 
-
+# Default client configurations
+# Each entry supplies default INNERTUBE_CONTEXT and the numeric client-name
 CLIENTS = {
-    # 'web': {
-    #     'INNERTUBE_CONTEXT': {
-    #         'client': {
-    #             'clientName': 'WEB',
-    #             'clientVersion': '2.20260309.01.00',
-    #             'userAgent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-    #         },
-    #     },
-    #     'INNERTUBE_CONTEXT_CLIENT_NAME': 1,
-    #     'SUPPORTS_COOKIES': True,
-    # },
-    'web_safari': {
-        'INNERTUBE_CONTEXT': {
-            'client': {
-                'clientName': 'WEB',
-                'clientVersion': '2.20260114.08.00',
-                'userAgent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)',
+    "web_safari": {
+        "INNERTUBE_CONTEXT": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20260114.08.00",
+                "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                             "(KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)",
             },
         },
-        'INNERTUBE_CONTEXT_CLIENT_NAME': 1,
-        'SUPPORTS_COOKIES': True,
+        "INNERTUBE_CONTEXT_CLIENT_NAME": 1,
     },
-    'android_vr': {
-        'INNERTUBE_CONTEXT': {
-            'client': {
-                'clientName': 'ANDROID_VR',
-                'clientVersion': '1.65.10',
-                'deviceMake': 'Oculus',
-                'deviceModel': 'Quest 3',
-                'androidSdkVersion': 32,
-                'userAgent': 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-                'osName': 'Android',
-                'osVersion': '12L',
+    "android_vr": {
+        "INNERTUBE_CONTEXT": {
+            "client": {
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.65.10",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "userAgent": "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; "
+                             "eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "osName": "Android",
+                "osVersion": "12L",
             },
         },
-        'INNERTUBE_CONTEXT_CLIENT_NAME': 28,
-        'REQUIRE_JS_PLAYER': False,
+        "INNERTUBE_CONTEXT_CLIENT_NAME": 28,
     },
 }
 
 
-def _get_data_from_regex(res: Response, regex, descr):
-    """Extract and parse JSON data from Response using regex."""
+def _get_data_from_regex(res: Response, regex, descr: str):
+    """Search *res.text* with *regex* and parse the first capture group as JSON.
+
+    Args:
+        res:   HTTP response whose text body is searched.
+        regex: Compiled or string pattern with one capture group.
+        descr: Human-readable label used in the debug log when no match is found.
+
+    Returns:
+        Parsed JSON object, or ``None`` if the pattern did not match.
+    """
     if match := re.search(regex, res.text):
         return parse_json(match.group(1))
-    log.debug(f"Missing {descr}")
+    log.debug("Pattern not found in response body: %s", descr)
 
 
 class TabExtractor:
-    """Extracts video ID from YouTube channel/live pages."""
-    valid_url_re = r'https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\#&]+)/live'
+    """Resolves a YouTube channel/live URL to a watch URL.
+
+    Fetches the channel page, extracts ``ytInitialData``, and returns a
+    :class:`NextExtractor` redirect pointing at the live video.
+    """
+
+    valid_url_re = r"https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\\#&]+)/live"
     extractor_type: ExtractorType = ExtractorType.TAB
-    _re_ytInitialData = re.compile(r"""var\s+ytInitialData\s*=\s*({.*?})\s*;\s*</script>""", re.DOTALL)
+
+    _re_ytInitialData = re.compile(
+        r"""var\s+ytInitialData\s*=\s*({.*?})\s*;\s*</script>""",
+        re.DOTALL,
+    )
 
     @staticmethod
-    def _schema_video_id(data):
-        """Validate and extract video ID from ytInitialData."""
-        schema = validate.Schema(
+    def _schema_video_id(data) -> str | None:
+        """Extract the live video ID from a parsed ``ytInitialData`` object.
+
+        Args:
+            data: Parsed ``ytInitialData`` dict.
+
+        Returns:
+            Video ID string, or ``None`` if the expected keys are absent.
+        """
+        return validate.Schema(
             {
                 "currentVideoEndpoint": {
-                    "watchEndpoint": {
-                        "videoId": str,
-                    },
+                    "watchEndpoint": {"videoId": str},
                 },
             },
             validate.get(("currentVideoEndpoint", "watchEndpoint", "videoId")),
-        )
-        return schema.validate(data)
+        ).validate(data)
 
-    def _get_initial_data(self, url):
-        """Fetch ytInitialData from channel page with retries."""
-        for _ in range(3):
+    def _get_initial_data(self, url: str) -> dict:
+        """Fetch and return ``ytInitialData`` from *url*, retrying up to 3 times.
+
+        YouTube occasionally returns a page without ``currentVideoEndpoint``,
+        so each attempt checks for that key before accepting the result.
+
+        Args:
+            url: Channel live page URL.
+
+        Returns:
+            Parsed ``ytInitialData`` dict, or ``{}`` if all attempts fail.
+        """
+        for attempt in range(1, 4):
             try:
-                log.debug(f"TabExtractor: getting ytInitialData for {url=}")
+                log.debug("Fetching ytInitialData (attempt %d/3): %s", attempt, url)
                 webpage = ctx.session.http.get(url)
                 initial = _get_data_from_regex(webpage, self._re_ytInitialData, "ytInitialData")
-                # YouTube sometimes returns incomplete data
-                if initial and initial.get('currentVideoEndpoint'):
+                if initial and initial.get("currentVideoEndpoint"):
+                    log.debug("ytInitialData obtained on attempt %d", attempt)
                     return initial
-            except Exception as e:
-                log.error(f"Failed to get ytInitialData: {e}")
+                log.debug("ytInitialData missing currentVideoEndpoint on attempt %d", attempt)
+            except Exception as exc:
+                log.error("Error fetching ytInitialData (attempt %d/3): %s", attempt, exc)
+        log.warning("All attempts to fetch ytInitialData failed for: %s", url)
         return {}
 
-    def extract(self, url) -> ExtractorResult:
-        """Extract video URL from channel/live page."""
-        url = urlunparse(urlparse(url)._replace(netloc='www.youtube.com'))
+    def extract(self, url: str) -> ExtractorResult:
+        """Extract the live video ID from a channel/live page and redirect.
+
+        Args:
+            url: YouTube channel/live URL (any supported variant).
+
+        Returns:
+            :class:`ExtractorResult` with ``next`` set to a
+            :class:`NextExtractor` pointing at the watch URL.
+
+        Raises:
+            ValueError: If no video ID could be found after all retries.
+        """
+        url = urlunparse(urlparse(url)._replace(netloc="www.youtube.com"))
+        log.debug("TabExtractor.extract: normalised URL -> %s", url)
         initial = self._get_initial_data(url)
         if video_id := self._schema_video_id(initial):
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            log.debug("Resolved video ID %s, redirecting to %s", video_id, watch_url)
             return ExtractorResult(
                 next=NextExtractor(
                     extractor=ExtractorType.VIDEO,
-                    url=f'https://www.youtube.com/watch?v={video_id}'
+                    url=watch_url
                 )
             )
-        raise ValueError('Unable to extract video ID from tab page')
+        raise ValueError("Unable to extract video ID from tab page")
 
 
 class VideoExtractor:
-    """Extracts HLS manifest URLs from YouTube video pages."""
-    valid_url_re = r'https://www\.youtube\.com/watch\?v=(?P<id>[0-9A-Za-z_-]{11})'
+    """Extracts HLS manifest URLs from a YouTube watch page.
+
+    Queries the ``/player`` endpoint for each configured client,
+    collects ``hlsManifestUrl`` values, and solves any ``n``-parameter
+    challenges via the injected :class:`JsSolver`.
+    """
+
+    valid_url_re = r"https://www\.youtube\.com/watch\?v=(?P<id>[0-9A-Za-z_-]{11})"
     extractor_type = ExtractorType.VIDEO
-    _re_ytcfg = re.compile(r'ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;')
-    _re_ytInitialPlayerResponse = re.compile(r"""var\s+ytInitialPlayerResponse\s*=\s*({.+?});\s*(?:var|</script>)""")
+
+    _re_ytcfg = re.compile(r"ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;")
+    _re_ytInitialPlayerResponse = re.compile(r"var\s+ytInitialPlayerResponse\s*=\s*({.+?});\s*(?:var|</script>)")
+
     video_id: str = None
 
-    def _get_webpage_data(self, url):
-        """Fetch and parse YouTube video page data."""
-        log.debug(f"VideoExtractor: getting webpage for {url=}")
-        ctx.session.http.headers['User-Agent'] = CLIENTS['web_safari']['INNERTUBE_CONTEXT']['client']['userAgent']
-        # webpage = ctx.session.http.get(url, params={'bpctr': '9999999999', 'has_verified': '1'})
-        webpage = requests.get(url, params={'bpctr': '9999999999', 'has_verified': '1'})
-        webpage_ytcfg = _get_data_from_regex(webpage, self._re_ytcfg, "ytcfg")
-        return webpage_ytcfg
+    def _get_webpage_data(self, url: str) -> dict:
+        """Fetch the watch page and return the parsed ``ytcfg`` object.
+
+        Sets the session ``User-Agent`` to the ``web_safari`` value so that
+        YouTube serves the standard desktop page layout.
+
+        Args:
+            url: Full watch URL including the ``v=`` parameter.
+
+        Returns:
+            Parsed ``ytcfg`` dict extracted from the page source.
+        """
+        log.debug("Fetching watch page: %s", url)
+        ctx.session.http.headers["User-Agent"] = CLIENTS["web_safari"]["INNERTUBE_CONTEXT"]["client"]["userAgent"]
+        webpage = ctx.session.http.get(url, params={"bpctr": "9999999999", "has_verified": "1"})
+        return _get_data_from_regex(webpage, self._re_ytcfg, "ytcfg")
 
     @staticmethod
-    def _build_headers(client_config, visitor_data, client_context):
-        """Build request headers for InnerTube API."""
-        client_version = client_context.get('clientVersion')
-        if not client_version:
-            client_version = client_config.get('INNERTUBE_CONTEXT', {}).get('client', {}).get('clientVersion'),
-        ua = client_context.get('userAgent') or client_config.get('INNERTUBE_CONTEXT', {}).get('client', {}).get('userAgent')
+    def _build_headers(client_config: dict, visitor_data: str, client_context: dict) -> dict:
+        """Assemble HTTP headers for an InnerTube ``/player`` request.
+
+        Falls back to the static client config when the live page context does
+        not carry ``clientVersion`` or ``userAgent``.
+
+        Args:
+            client_config:  Entry from :data:`CLIENTS` for the current client.
+            visitor_data:   ``X-Goog-Visitor-Id`` token extracted from ytcfg.
+            client_context: ``client`` sub-dict from the resolved InnerTube context.
+
+        Returns:
+            Dict of HTTP headers with ``None`` values removed.
+        """
+        default_client = client_config.get("INNERTUBE_CONTEXT", {}).get("client", {})
+        client_version = client_context.get("clientVersion") or default_client.get("clientVersion")
+        ua = client_context.get("userAgent") or default_client.get("userAgent")
         return {
             k: v for k, v in {
-                'X-YouTube-Client-Name': str(client_config.get('INNERTUBE_CONTEXT_CLIENT_NAME')),
-                'X-YouTube-Client-Version': client_version,
-                'Origin': 'https://www.youtube.com',
-                'X-Goog-Visitor-Id': visitor_data,
-                'User-Agent': ua,
-                'content-type': 'application/json',
+                "X-YouTube-Client-Name": str(client_config.get("INNERTUBE_CONTEXT_CLIENT_NAME")),
+                "X-YouTube-Client-Version": client_version,
+                "Origin": "https://www.youtube.com",
+                "X-Goog-Visitor-Id": visitor_data,
+                "User-Agent": ua,
+                "content-type": "application/json",
             }.items() if v is not None
         }
 
-    def _build_player_request_payload(self, client_context, webpage_ytcfg):
-        """Build InnerTube player request payload."""
+    def _build_player_request_payload(self, client_context: dict, webpage_ytcfg: dict) -> dict:
+        """Build the JSON body for ``/player`` POST request.
 
+        Args:
+            client_context: ``client`` sub-dict from the resolved context.
+            webpage_ytcfg:  Parsed ``ytcfg`` from the webpage.
+
+        Returns:
+            Dict ready to be serialized as the POST body.
+        """
         return {
-            'context': client_context,
-            'videoId': self.video_id,
-            'playbackContext': {
-                'contentPlaybackContext': {
-                    'html5Preference': 'HTML5_PREF_WANTS',
-                    # 'signatureTimestamp': 20514
-                    **({'signatureTimestamp': sts} if (sts := webpage_ytcfg.get('STS')) else {})
+            "context": client_context,
+            "videoId": self.video_id,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS",
+                    **( {"signatureTimestamp": sts} if (sts := webpage_ytcfg.get("STS")) else {}),
                 },
             },
-            'contentCheckOk': True,
-            'racyCheckOk': True
+            "contentCheckOk": True,
+            "racyCheckOk": True,
         }
 
-    def _extract_player_response(self, client, webpage_ytcfg, visitor_data):
-        """Request player response from InnerTube API."""
+    def _extract_player_response(self, client: str, webpage_ytcfg: dict, visitor_data: str) -> dict:
+        """Call the ``/player`` endpoint for *client* and return the response.
+
+        Prefers the context embedded in *webpage_ytcfg* over default values
+        then overrides locale/timezone fields to ensure
+        consistent responses.
+
+        Args:
+            client:        Key into :data:`CLIENTS` (e.g. ``"web_safari"``).
+            webpage_ytcfg: Parsed ``ytcfg`` from the watch page.
+            visitor_data:  Visitor token for the ``X-Goog-Visitor-Id`` header.
+
+        Returns:
+            Parsed JSON response from the ``/player`` endpoint.
+        """
+
+        # Prefer live page context; fall back to static client config.
         client_config = CLIENTS[client].copy()
-        context = webpage_ytcfg.get('INNERTUBE_CONTEXT', {}) or client_config.get('INNERTUBE_CONTEXT', {})
-        client_context = context.get('client', {})
-        client_context.update({'hl': 'en', 'timeZone': 'UTC', 'utcOffsetMinutes': 0})
+        context = webpage_ytcfg.get("INNERTUBE_CONTEXT") or client_config.get("INNERTUBE_CONTEXT", {})
+        client_context = context.get("client", {})
+        client_context.update({"hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0})
 
         headers = self._build_headers(client_config, visitor_data, client_context)
-        print(f"{headers=}")
-        data = self._build_player_request_payload(context, webpage_ytcfg)
-        print(f"{data=}")
+        payload = self._build_player_request_payload(context, webpage_ytcfg)
         response = ctx.session.http.post(
-            'https://www.youtube.com/youtubei/v1/player',
-            params={'prettyPrint': 'false'},
+            "https://www.youtube.com/youtubei/v1/player",
+            params={"prettyPrint": "false"},
             headers=headers,
-            data=json.dumps(data).encode('utf8'),
+            data=json.dumps(payload).encode("utf-8"),
         )
         return response.json()
 
     @staticmethod
-    def _schema_visitor_data(data):
-        """Validate and extract visitor data."""
-        schema = validate.Schema(
+    def _schema_visitor_data(data) -> str:
+        """Extract the visitor-data token from a parsed ``ytcfg`` object.
+
+        Accepts either the top-level ``VISITOR_DATA`` key or the nested
+        ``INNERTUBE_CONTEXT.client.visitorData`` path.
+
+        Args:
+            data: Parsed ``ytcfg`` dict.
+
+        Returns:
+            Visitor-data string.
+        """
+        return validate.Schema(
             validate.any(
-                validate.all(
-                    {"VISITOR_DATA": str},
-                    validate.get("VISITOR_DATA"),
-                ),
+                validate.all({"VISITOR_DATA": str}, validate.get("VISITOR_DATA")),
                 validate.all(
                     {"INNERTUBE_CONTEXT": {"client": {"visitorData": str}}},
                     validate.get(("INNERTUBE_CONTEXT", "client", "visitorData")),
                 ),
             ),
-        )
-        return schema.validate(data)
+        ).validate(data)
 
     @staticmethod
-    def _schema_player_url(data):
+    def _schema_player_url(data) -> str:
+        """Extract and normalize the JS player URL from a parsed ``ytcfg`` object.
 
-        schema = validate.Schema(
+        Accepts either ``PLAYER_JS_URL`` or the first ``jsUrl`` found inside
+        ``WEB_PLAYER_CONTEXT_CONFIGS``, and prepends the YouTube origin when
+        the URL is relative.
+
+        Args:
+            data: Parsed ``ytcfg`` dict.
+
+        Returns:
+            Absolute player JS URL.
+        """
+        return validate.Schema(
             validate.any(
+                validate.all({"PLAYER_JS_URL": str}, validate.get("PLAYER_JS_URL")),
                 validate.all(
-                    {"PLAYER_JS_URL": str},
-                    validate.get("PLAYER_JS_URL"),
-                ),
-                validate.all(
-                    {
-                        "WEB_PLAYER_CONTEXT_CONFIGS": {
-                            str: {"jsUrl": str}
-                        }
-                    },
+                    {"WEB_PLAYER_CONTEXT_CONFIGS": {str: {"jsUrl": str}}},
                     validate.get("WEB_PLAYER_CONTEXT_CONFIGS"),
                     validate.transform(lambda x: next(iter(x.values()))),
                     validate.get("jsUrl"),
                 ),
             ),
             validate.transform(
-                lambda url: url if url.startswith("https://www.youtube.com") else f"https://www.youtube.com{url}"),
-        )
-        return schema.validate(data)
+                lambda url: url if url.startswith("https://www.youtube.com")
+                else f"https://www.youtube.com{url}"
+            ),
+        ).validate(data)
 
-    def _extract_player_responses(self, webpage_ytcfg):
-        """Extract player responses from multiple InnerTube clients."""
+    def _extract_player_responses(self, webpage_ytcfg: dict) -> tuple[list[dict], str]:
+        """Query all configured clients and collect valid player responses.
+
+        Iterates `CLIENTS` in reverse insertion order (``android_vr`` first)
+        so that the client most likely to return unthrottled streams is tried first.
+
+        Args:
+            webpage_ytcfg: Parsed ``ytcfg`` from the watch page.
+
+        Returns:
+            Tuple of ``(player_responses, player_url)`` where *player_responses*
+            is a list of dicts that each contain a ``streamingData`` key.
+
+        Raises:
+            ValueError: If no client returns a response with ``streamingData``.
+        """
         player_responses = []
         visitor_data = self._schema_visitor_data(webpage_ytcfg)
-
         player_url = self._schema_player_url(webpage_ytcfg)
+        log.debug("Player JS URL: %s", player_url)
 
-        # Try clients in reverse order
-        for client in reversed(list(CLIENTS.keys())):
+        for client in reversed(list(CLIENTS)):
             try:
-                player_response = self._extract_player_response(
-                    client,
-                    webpage_ytcfg=webpage_ytcfg,
-                    visitor_data=visitor_data,
-                )
-            except Exception as e:
-                log.error(f'Could not get player_response for {client}: {e}')
-
+                response = self._extract_player_response(client, webpage_ytcfg, visitor_data)
+            except Exception as exc:
+                log.error("Player request failed for client %s: %s", client, exc)
                 continue
 
-            if player_response:
-                # Annotate response with client metadata
-                if not player_response.get('streamingData'):
-                    log.warning(f'No streamingData in player_response for {client}')
-                    continue
-                player_responses.append(player_response)
+            if not response:
+                log.debug("Empty player response for client %s, skipping", client)
+                continue
+
+            if not response.get("streamingData"):
+                log.warning("No streamingData in player response for client %s", client)
+                continue
+
+            log.debug("Valid player response received for client %s", client)
+            player_responses.append(response)
 
         if not player_responses:
-            raise ValueError('Failed to extract any player response')
+            raise ValueError("Failed to extract any player response with streamingData")
 
         return player_responses, player_url
 
-    def _solve_n_challenge(self, n_challenge, player_url):
-        """Solve YouTube n-parameter challenge using Deno."""
-        challenge = JsChallengeRequest(
-            type=JsChallengeType.N,
-            video_id=self.video_id,
-            input=NChallengeInput(challenge=n_challenge, player_url=player_url)
-        )
-        return ctx.deno.solve(challenge)
+    @staticmethod
+    def _extract_hls(player_responses: list[dict], player_url: str) -> list[str]:
+        """Collect HLS manifest URLs from *player_responses*, solving n-challenges.
 
-    def _extract_hls(self, player_responses, player_url):
-        """Extract HLS manifest URLs and solve n-challenges."""
+        For each manifest URL that contains an ``/n/<token>/`` path segment,
+        the token is submitted to the injected `JsSolver`.
+        URLs whose challenge cannot be solved are dropped with a warning.
+
+        Args:
+            player_responses: List of InnerTube player response dicts.
+            player_url:       Absolute URL of the player JS bundle used by the solver.
+
+        Returns:
+            List of HLS manifest URLs.
+        """
         hls_list = []
 
-        for player_response in player_responses:
-            print("player_response")
-            streaming_data = player_response.get('streamingData')
+        for response in player_responses:
+            streaming_data = response.get("streamingData")
             if not streaming_data:
-                print("if not streaming_data:")
+                log.debug("Skipping player response with no streamingData")
                 continue
 
-            hls_manifest_url = streaming_data.get('hlsManifestUrl')
+            hls_manifest_url = streaming_data.get("hlsManifestUrl")
             if not hls_manifest_url:
-                print("if not hls_manifest_url:")
-                print("streamingData")
-                print(streaming_data)
+                log.debug("No hlsManifestUrl in streamingData: %s", streaming_data)
                 continue
 
-            # Extract and solve n-challenge if present
-            if matches := re.findall(r'/n/([^/]+)/', urlparse(hls_manifest_url).path):
-                n_challenge = matches[0]
-                print(f"{n_challenge=}")
-                challenge_response = self._solve_n_challenge(n_challenge, player_url)
+            # Solve the n-parameter challenge embedded in the manifest path.
+            if n_matches := re.findall(r"/n/([^/]+)/", urlparse(hls_manifest_url).path):
+                n_token = n_matches[0]
+                log.debug("Solving n-challenge token: %s", n_token)
+                result = ctx.deno.solve(NChallengeInput(token=n_token, player_url=player_url))
 
-                if challenge_response and (n_result := challenge_response.output.results.get(n_challenge)):
-                    hls_manifest_url = hls_manifest_url.replace(f'/n/{n_challenge}', f'/n/{n_result}')
+                if result and (solved := result.results.get(n_token)):
+                    hls_manifest_url = hls_manifest_url.replace(f"/n/{n_token}", f"/n/{solved}")
+                    log.debug("n-challenge solved: %s -> %s", n_token, solved)
                     hls_list.append(hls_manifest_url)
                 else:
-                    log.warning(f'Failed to solve n challenge: {n_challenge}')
+                    log.warning("Failed to solve n-challenge token: %s", n_token)
             else:
                 hls_list.append(hls_manifest_url)
 
+        log.debug("Collected %d HLS manifest URL(s)", len(hls_list))
         return hls_list
 
     def extract(self, url: str) -> ExtractorResult:
-        """Extract HLS manifest URLs from video page."""
-        hls = []
-        for _ in range(3):
+        """Extract HLS manifest URLs from a YouTube watch URL, retrying up to 3 times.
+
+        Args:
+            url: Full ``/watch?v=<id>`` URL.
+
+        Returns:
+            :class:`ExtractorResult` with ``hls`` set to the list of resolved manifest URLs.
+        """
+        hls: list[str] = []
+
+        for attempt in range(1, 4):
             time.sleep(1)
-            self.video_id = re.search(self.valid_url_re, url).group('id')
+            self.video_id = re.search(self.valid_url_re, url).group("id")
+            log.debug("VideoExtractor.extract attempt %d/3 — video_id: %s", attempt, self.video_id)
+
             webpage_ytcfg = self._get_webpage_data(url)
 
             try:
                 player_responses, player_url = self._extract_player_responses(webpage_ytcfg)
-            except ValueError as e:
-                log.error(f"Failed to extract player responses: {e}")
+            except ValueError as exc:
+                log.error("Player response extraction failed (attempt %d/3): %s", attempt, exc)
                 continue
+
             hls = self._extract_hls(player_responses, player_url)
-            if not hls:
-                continue
-            break
+            if hls:
+                log.debug("HLS extraction succeeded")
+                break
+            log.warning("No HLS URLs on attempt %d/3, retrying", attempt)
 
         return ExtractorResult(hls=hls)

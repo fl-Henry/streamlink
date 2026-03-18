@@ -102,26 +102,31 @@ class Youtube(Plugin):
         return self._next_extract(prev_result=extractor().extract(url))
 
     def _check_streams(self, urls):
-        """Parse and probe HLS variant playlists, discarding unreachable streams."""
-        playlist = []
+        """Parse and probe HLS variant playlists, discarding unreachable streams.
+
+        Args:
+            urls: HLS manifest URLs to probe
+
+        Yields:
+            tuple[str, HLSStream]: Stream quality name and HLS stream object
+        """
         for m3u8_url in urls:
             try:
-                for k, v in HLSStream.parse_variant_playlist(self.session, m3u8_url).items():
-                    with v.open() as fd:
-                        fd.timeout = 2
-                        fd.read(64)
-                    playlist.append((k, v))
+                variant_playlist = HLSStream.parse_variant_playlist(self.session, m3u8_url)
+                v = next(iter(variant_playlist.values()))
+                with v.open() as fd:
+                    fd.timeout = 2
+                    fd.read(64)
+                yield from variant_playlist.items()
             except Exception as e:
                 log.warning(f"Skipping unreachable stream {m3u8_url}: {e}")
-        print(f'{playlist=}')
-        return playlist
 
     def _get_streams(self):
         """Extract and yield HLS streams from YouTube.
 
-                Yields:
-                    tuple[str, HLSStream]: Stream quality name and HLS stream object
-                """
+        Yields:
+            tuple[str, HLSStream]: Stream quality name and HLS stream object
+        """
         try:
             # Extract HLS manifest URLs through extractor chain
             yield from self._check_streams(self._next_extract())
