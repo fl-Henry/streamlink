@@ -15,7 +15,7 @@ from streamlink.stream.hls import HLSStream
 from .deno import DenoJCP
 from .structures import Extractor, ExtractorResult, ctx, StreamPick
 from .extractors import VideoExtractor, LiveExtractor, StreamsExtractor
-from .youtube_original import YouTube as YtOriginal
+from .youtube import YouTube as YtOriginal
 
 log = logging.getLogger(__name__)
 
