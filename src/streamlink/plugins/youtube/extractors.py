@@ -150,7 +150,7 @@ class StreamsExtractor:
                     validate.transform(lambda _: None),
                 )
             ],
-            validate.filter(None.__ne__),
+            validate.filter(lambda v: v is not None),
             # Keep only active streams: must have a viewer count and not be scheduled
             validate.filter(lambda v: v.get("viewCountText", {}).get("runs") and not v.get("upcomingEventData")),
             validate.map(lambda v: (v["videoId"], v["viewCountText"]["runs"])),
