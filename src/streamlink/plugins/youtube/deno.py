@@ -232,4 +232,7 @@ class DenoJCP:
 
         except Exception as exc:
             log.error("n-challenge solving failed for token %r: %s", challenge.token, exc)
-            return None
+            if 'The system cannot find the file specified' in str(exc):
+                raise Exception("Deno not found. "
+                                "Please install Deno from https://deno.land/manual/getting_started/installation")
+            return NChallengeOutput(results={})
