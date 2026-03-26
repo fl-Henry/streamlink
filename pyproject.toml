@@ -5,7 +5,7 @@ requires = [
   # as the version string is already built into it (see the onbuild versioningit hook):
   "versioningit >=2.0.0,<4",  # disabled in sdist
 ]
-# setuptools build-backend override
+# setuptools builexplod-backend override
 # https://setuptools.pypa.io/en/stable/build_meta.html
 backend-path = ["build_backend"]
 build-backend = "__init__"
@@ -163,6 +163,9 @@ streamlink = [
 ]
 "streamlink.plugins" = [
   "_plugins.json",
+]
+"streamlink.solvers.youtube" = [
+  "*.js",
 ]
 
 
