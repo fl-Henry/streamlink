@@ -9,16 +9,15 @@ $metadata category
 $metadata title
 $notes VOD content and protected videos are not supported
 """
-
-
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
 
 import re
 import json
 from urllib.parse import urlparse, urlunparse
 
+import trio
 from requests import Response
 
 from streamlink.session.session import Streamlink
@@ -32,6 +31,8 @@ from streamlink.utils.parse import parse_json
 from streamlink.utils.data import search_dict
 from streamlink.utils.deno import Deno
 import streamlink.solvers.youtube as solver
+from streamlink.compat import BaseExceptionGroup  # noqa: PLC0415
+from streamlink.webbrowser.cdp import CDPClient, CDPClientSession, devtools
 
 log = getLogger(__name__)
 
@@ -75,37 +76,6 @@ _url_canonical: str = "https://www.youtube.com/watch?v={video_id}"
 _url_channelid_live: str = "https://www.youtube.com/channel/{channel_id}/live"
 
 
-class StreamPick(Enum):
-    """Named ordering options for stream selection."""
-    FIRST = "first"
-    LAST = "last"
-    POPULAR = "popular"
-
-
-@dataclass(frozen=True)
-class StreamSelection:
-    """Represents a stream selection option from the /streams page.
-
-    Can be ``first``, ``last``, ``popular``, or a 1-based position number.
-
-    Args:
-        value: A :class:`StreamPick` value, or a positive :class:`int` position.
-    """
-    value: StreamPick | int
-
-    def __post_init__(self):
-        try:
-            if isinstance(self.value, str) and self.value.isdigit():
-                object.__setattr__(self, "value", int(self.value))
-            elif isinstance(self.value, str):
-                object.__setattr__(self, "value", StreamPick(self.value))
-            if isinstance(self.value, int) and self.value < 1:
-                raise ValueError()
-        except ValueError:
-            log.warning("Invalid stream selection option %r, defaulting to %r", self.value, StreamPick.POPULAR.value)
-            object.__setattr__(self, "value", StreamPick.POPULAR)
-
-
 @dataclass(frozen=True)
 class NChallengeInput:
     """Input data for a YouTube n-parameter challenge.
@@ -128,112 +98,46 @@ class NChallengeOutput:
     results: dict[str, str] = field(default_factory=dict)
 
 
-class ExtractorType(Enum):
-    """Discriminator for the YouTube Extractors."""
-    VIDEO = "video"  # youtube.com/watch?v=<id>
-    LIVE = "live"    # youtube.com/@handle/live, /channel/<id>/live, etc.
-    STREAMS = "streams"  # youtube.com/@handle/streams, /channel/<id>/streams, etc.
-
-
-@dataclass(frozen=True)
-class NextExtractor:
-    """Redirect instruction returned when one extractor defers to another.
-
-    Args:
-        extractor: Target extractor type to invoke next.
-        url: Resolved URL to pass to that extractor.
-    """
-    extractor: ExtractorType
-    url: str
-
-
-@dataclass(frozen=True)
-class ExtractorResult:
-    """Return value from any extractor.
-
-    Exactly one field should be set per result:
-
-    Args:
-        next: Populated when the extractor delegates to another extractor.
-        hls:  Populated when the extractor has resolved final HLS manifest URLs.
-    """
-    next: NextExtractor | None = None
-    hls: list[str] | None = None
-
-
-class Extractor(Protocol):
-    """Structural interface that every YouTube extractor must implement."""
-
-    valid_url_re: str
-    """Regex pattern used to decide whether this extractor owns a given URL."""
-
-    extractor_type: ExtractorType
-    """Enum value that identifies this extractor."""
-
+class Solver(ABC):
     def __init__(self, session: Streamlink):
-        """Initialize the extractor with the current session context.
-
-        Args:
-            session: Current session context.
-        """
-        ...
-
-    def extract(self, url: str) -> ExtractorResult:
-        """Run extraction for *url* and return a result or a redirect.
-
-        Args:
-            url: The URL to extract streams from.
-
-        Returns:
-            An :class:`ExtractorResult` with either ``next`` or ``hls`` set.
-        """
-        ...
-
-
-class DenoSolver(Deno):
-    """Solves YouTube n-parameter challenges by executing JS inside a Deno subprocess."""
-
-    def __init__(self):
         super().__init__()
         self._code_cache: dict[str, str] = {}  # player_url -> raw JS source text
+        self.session = session
+
+    @abstractmethod
+    def solve(self, challenge: NChallengeInput) -> NChallengeOutput | None:
+        pass
 
     @staticmethod
-    def validate_response(response: NChallengeOutput, request: NChallengeInput) -> bool | str:
-        """Validate that *response* is a well-formed, successful challenge result.
+    def validate_output(output: str | dict, request: NChallengeInput) -> NChallengeOutput:
+        if isinstance(output, str):
+            output = json.loads(output)
+        if output.get("type") == "error":
+            raise Exception(f"Solver top-level error: {output['error']}")
 
-        A result is considered invalid when:
+        response_data = output["responses"][0]
+        if response_data.get("type") == "error":
+            raise Exception(f"Solver response error for challenge {request.token!r}: {response_data['error']}")
 
-        - *response* is not an :class:`NChallengeOutput` instance.
-        - Any key or value in ``results`` is not a plain string.
-        - The original token is absent from ``results``.
-        - A result value ends with the original challenge token, which indicates
-          the YouTube JS solver function raised an internal exception and echoed
-          the input back as the output.
+        response = NChallengeOutput(response_data["data"])
+        log.debug("Raw solver response: %s", response)
 
-        Args:
-            response: Output produced by the Deno subprocess.
-            request:  Original challenge input used to generate *response*.
-
-        Returns:
-            ``True`` when the response is valid, or an error message string
-            describing the first problem found.
-        """
         if not isinstance(response, NChallengeOutput):
-            return "Response is not an NChallengeOutput"
+            log.warning("Response is not an NChallengeOutput")
 
         if not (
             all(isinstance(k, str) and isinstance(v, str) for k, v in response.results.items())
             and request.token in response.results
         ):
-            return "Invalid NChallengeOutput: missing token or non-string entries"
+            log.warning("Invalid NChallengeOutput: missing token or non-string entries")
 
         # When the JS solver throws internally it returns the input token as the
         # result, so a result that ends with the original challenge is a failure.
         for challenge, result in response.results.items():
             if result.endswith(challenge):
-                return f"n result is invalid for {challenge!r}: {result!r}"
+                log.warning(f"n result is invalid for {challenge!r}: {result!r}")
 
-        return True
+        return response
 
     @staticmethod
     def _get_script(script_type: str) -> str:
@@ -300,6 +204,10 @@ class DenoSolver(Deno):
                 log.warning("Empty response for player JS URL: %s", player_url)
         return self._code_cache.get(player_url)
 
+
+class DenoSolver(Solver, Deno):
+    """Solves YouTube n-parameter challenges by executing JS inside a Deno subprocess."""
+
     def solve(self, challenge: NChallengeInput) -> NChallengeOutput | None:
         """Solve a single YouTube n-parameter challenge using Deno.
 
@@ -323,24 +231,8 @@ class DenoSolver(Deno):
 
             stdin = self._construct_stdin(player, challenge)
             stdout = self.execute(stdin)
-            output = json.loads(stdout)
 
-            if output.get("type") == "error":
-                raise Exception(f"Solver top-level error: {output['error']}")
-
-            response_data = output["responses"][0]
-            if response_data.get("type") == "error":
-                raise Exception(
-                    f"Solver response error for challenge {challenge!r}: {response_data['error']}"
-                )
-
-            response = NChallengeOutput(response_data["data"])
-            log.debug("Raw solver response: %s", response)
-
-            if (validation_msg := self.validate_response(response, challenge)) is not True:
-                log.warning("Invalid n-challenge response from Deno: %s", validation_msg)
-
-            return response
+            return self.validate_output(stdout, challenge)
 
         except Exception as exc:
             log.error("n-challenge solving failed for token %r: %s", challenge.token, exc)
@@ -350,40 +242,203 @@ class DenoSolver(Deno):
             return NChallengeOutput(results={})
 
 
-def _get_data_from_regex(res: Response, regex, descr: str):
-    """Search *res.text* with *regex* and parse the first capture group as JSON.
+class CDPSolver(Solver):
 
-    Returns ``None`` and logs *descr* at DEBUG level if the pattern does not match.
-    """
-    if match := re.search(regex, res.text):
-        return parse_json(match.group(1))
-    log.debug("Pattern not found in response body: %s", descr)
+    def solve(self, challenge: NChallengeInput) -> NChallengeOutput | None:
+        events: str | None = None
+        eval_timeout = self.session.get_option("webbrowser-timeout")
+        url = challenge.player_url
 
+        player = self._get_player(challenge.player_url)
+        if not player:
+            log.error("Could not retrieve player JS for URL: %s", challenge.player_url)
+            return None
+        stdin = self._construct_stdin(player, challenge)
 
-def _get_initial_data(url: str, require_key: str = None) -> dict:
-    """Fetch ``ytInitialData`` from *url*, retrying up to 3 times.
+        async def on_main(client_session: CDPClientSession, request: devtools.fetch.RequestPaused):
+            async with client_session.alter_request(request) as cm:
+                cm.body = "<!doctype html>"
 
-    If *require_key* is given, an attempt is only accepted when that key is
-    present in the parsed result (YouTube occasionally omits it on first load).
+        async def solve_n_challenge(client: CDPClient):
+            async with client.session() as client_session:
+                client_session.add_request_handler(on_main, url_pattern=url, on_request=True)
 
-    Returns ``{}`` if all attempts fail.
-    """
-    for attempt in range(1, 4):
+                async with client_session.navigate(url) as frame_id:
+                    await client_session.loaded(frame_id)
+                    logs = []
+
+                    # Enable runtime to capture console events
+                    await client_session.cdp_session.send(devtools.runtime.enable())
+
+                    async def collect_logs():
+                        async for event in client_session.cdp_session.listen(devtools.runtime.ConsoleAPICalled):
+                            logs.append(event)
+
+                    async with trio.open_nursery() as nursery:
+                        nursery.start_soon(collect_logs)
+                        await client_session.evaluate(stdin, timeout=eval_timeout)
+                        nursery.cancel_scope.cancel()
+
+                    return logs
+
         try:
-            log.debug("Fetching ytInitialData (attempt %d): %s", attempt, url)
-            webpage = self.session.http.get(url)
-            initial = _get_data_from_regex(webpage, _re_ytInitialData, "ytInitialData")
-            if require_key and not (initial and initial.get(require_key)):
-                log.debug("ytInitialData missing %r on attempt %d", require_key, attempt)
-                continue
-            return initial
-        except Exception as exc:
-            log.error("Error fetching ytInitialData (attempt %d): %s", attempt, exc)
-    log.warning("All attempts to fetch ytInitialData failed for: %s", url)
-    return {}
+            events = CDPClient.launch(self.session, solve_n_challenge)
+        except BaseExceptionGroup:
+            log.exception("Failed acquiring client integrity token")
+        except Exception as err:
+            log.error(err)
+
+        if not events:
+            return None
+
+        stdout = {}
+        for event in events:
+            for arg in event.args:
+                try:
+                    stdout = json.loads(arg.value)
+                    if stdout.get("type"):
+                        break
+                except Exception:
+                    pass
+
+        return self.validate_output(stdout, challenge)
 
 
-class StreamsExtractor:
+class StreamPick(Enum):
+    """Named ordering options for stream selection."""
+    FIRST = "first"
+    LAST = "last"
+    POPULAR = "popular"
+
+
+@dataclass(frozen=True)
+class StreamSelection:
+    """Represents a stream selection option from the /streams page.
+
+    Can be ``first``, ``last``, ``popular``, or a 1-based position number.
+
+    Args:
+        value: A :class:`StreamPick` value, or a positive :class:`int` position.
+    """
+    value: StreamPick | int
+
+    def __post_init__(self):
+        try:
+            if isinstance(self.value, str) and self.value.isdigit():
+                object.__setattr__(self, "value", int(self.value))
+            elif isinstance(self.value, str):
+                object.__setattr__(self, "value", StreamPick(self.value))
+            if isinstance(self.value, int) and self.value < 1:
+                raise ValueError()
+        except ValueError:
+            log.warning("Invalid stream selection option %r, defaulting to %r", self.value, StreamPick.POPULAR.value)
+            object.__setattr__(self, "value", StreamPick.POPULAR)
+
+
+class ExtractorType(Enum):
+    """Discriminator for the YouTube Extractors."""
+    VIDEO = "video"  # youtube.com/watch?v=<id>
+    LIVE = "live"  # youtube.com/@handle/live, /channel/<id>/live, etc.
+    STREAMS = "streams"  # youtube.com/@handle/streams, /channel/<id>/streams, etc.
+
+
+@dataclass(frozen=True)
+class NextExtractor:
+    """Redirect instruction returned when one extractor defers to another.
+
+    Args:
+        extractor: Target extractor type to invoke next.
+        url: Resolved URL to pass to that extractor.
+    """
+    extractor: ExtractorType
+    url: str
+
+
+@dataclass(frozen=True)
+class ExtractorResult:
+    """Return value from any extractor.
+
+    Exactly one field should be set per result:
+
+    Args:
+        next: Populated when the extractor delegates to another extractor.
+        hls:  Populated when the extractor has resolved final HLS manifest URLs.
+    """
+    next: NextExtractor | None = None
+    hls: list[str] | None = None
+
+
+class Extractor(ABC):
+    """Structural interface that every YouTube extractor must implement."""
+
+    def __init__(self, session: Streamlink, options: dict | None = None):
+        """Initialize the extractor with the current session context.
+
+        Args:
+            session: Current session context.
+            options: Any Streamlink options
+        """
+        self.session = session
+        self.options = options or {}
+
+    @property
+    @abstractmethod
+    def valid_url_re(self) -> str:
+        """Regex pattern used to decide whether this extractor owns a given URL."""
+        pass
+
+    @property
+    @abstractmethod
+    def extractor_type(self) -> ExtractorType:
+        """Enum value that identifies this extractor."""
+        pass
+
+    @abstractmethod
+    def extract(self, url: str) -> ExtractorResult:
+        """Run extraction for *url* and return a result or a redirect.
+
+        Args:
+            url: The URL to extract streams from.
+
+        Returns:
+            An :class:`ExtractorResult` with either ``next`` or ``hls`` set.
+        """
+        pass
+
+    @staticmethod
+    def get_data_from_regex(res: Response, regex, descr: str):
+        """Search *res.text* with *regex* and parse the first capture group as JSON.
+
+        Returns ``None`` and logs *descr* at DEBUG level if the pattern does not match.
+        """
+        if match := re.search(regex, res.text):
+            return parse_json(match.group(1))
+        log.debug("Pattern not found in response body: %s", descr)
+
+    def _get_initial_data(self, url: str, require_key: str = None) -> dict:
+        """Fetch ``ytInitialData`` from *url*, retrying up to 3 times.
+
+        If *require_key* is given, an attempt is only accepted when that key is
+        present in the parsed result (YouTube occasionally omits it on first load).
+
+        Returns ``{}`` if all attempts fail.
+        """
+        for attempt in range(1, 4):
+            try:
+                log.debug("Fetching ytInitialData (attempt %d): %s", attempt, url)
+                webpage = self.session.http.get(url)
+                initial = self.get_data_from_regex(webpage, _re_ytInitialData, "ytInitialData")
+                if require_key and not (initial and initial.get(require_key)):
+                    log.debug("ytInitialData missing %r on attempt %d", require_key, attempt)
+                    continue
+                return initial
+            except Exception as exc:
+                log.error("Error fetching ytInitialData (attempt %d): %s", attempt, exc)
+        log.warning("All attempts to fetch ytInitialData failed for: %s", url)
+        return {}
+
+
+class StreamsExtractor(Extractor):
     """Resolves a YouTube ``/streams`` channel page to a ``/watch`` URL.
 
     Fetches ``ytInitialData``, filters active (non-upcoming) streams, selects
@@ -392,9 +447,6 @@ class StreamsExtractor:
 
     valid_url_re = r"https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\\#&]+)/streams"
     extractor_type: ExtractorType = ExtractorType.LIVE
-
-    def __init__(self, session: Streamlink):
-        self.session = session
 
     @staticmethod
     def _schema_tab_data(data) -> dict | None:
@@ -463,7 +515,7 @@ class StreamsExtractor:
 
     def extract(self, url: str) -> ExtractorResult:
         """Return a redirect to the selected live video from a ``/streams`` page."""
-        initial = _get_initial_data(url)
+        initial = self._get_initial_data(url)
         tab_data = self._schema_tab_data(initial)
         active_streams = self._schema_active_streams(tab_data)
         log.debug("Active streams found: %d", len(active_streams) if active_streams else 0)
@@ -478,7 +530,7 @@ class StreamsExtractor:
         )
 
 
-class LiveExtractor:
+class LiveExtractor(Extractor):
     """Resolves a YouTube ``/live`` channel URL to a ``/watch`` URL.
 
     Fetches ``ytInitialData`` and follows ``currentVideoEndpoint`` to the
@@ -487,9 +539,6 @@ class LiveExtractor:
 
     valid_url_re = r"https://www\.youtube\.com/(?:@|c(?:hannel)?/|user/)?(?P<id>[^/?\\#&]+)/live"
     extractor_type: ExtractorType = ExtractorType.LIVE
-
-    def __init__(self, session: Streamlink):
-        self.session = session
 
     @staticmethod
     def _schema_video_id(data) -> str | None:
@@ -511,7 +560,7 @@ class LiveExtractor:
         """
         url = urlunparse(urlparse(url)._replace(netloc="www.youtube.com"))
         log.debug("TabExtractor.extract: normalised URL -> %s", url)
-        initial = _get_initial_data(str(url), "currentVideoEndpoint")
+        initial = self._get_initial_data(str(url), "currentVideoEndpoint")
         if video_id := self._schema_video_id(initial):
             watch_url = f"https://www.youtube.com/watch?v={video_id}"
             log.debug("Resolved video ID %s, redirecting to %s", video_id, watch_url)
@@ -524,7 +573,7 @@ class LiveExtractor:
         raise ValueError("Unable to extract video ID from /live page")
 
 
-class VideoExtractor:
+class VideoExtractor(Extractor):
     """Extracts HLS manifest URLs from a YouTube ``/watch`` page.
 
     Queries the InnerTube ``/player`` endpoint for each client in :data:`CLIENTS`,
@@ -537,9 +586,6 @@ class VideoExtractor:
 
     video_id: str = None
 
-    def __init__(self, session: Streamlink):
-        self.session = session
-
     def _get_webpage_data(self, url: str) -> dict:
         """Fetch *url* and return the parsed ``ytcfg`` object.
 
@@ -549,7 +595,7 @@ class VideoExtractor:
         log.debug("Fetching watch page: %s", url)
         self.session.http.headers["User-Agent"] = CLIENTS["web_safari"]["INNERTUBE_CONTEXT"]["client"]["userAgent"]
         webpage = self.session.http.get(url, params={"bpctr": "9999999999", "has_verified": "1"})
-        return _get_data_from_regex(webpage, _re_ytcfg, "ytcfg")
+        return self.get_data_from_regex(webpage, _re_ytcfg, "ytcfg")
 
     @staticmethod
     def _build_headers(client_config: dict, visitor_data: str, client_context: dict) -> dict:
@@ -692,15 +738,18 @@ class VideoExtractor:
 
         return player_responses, player_url
 
-    @staticmethod
-    def _extract_hls(player_responses: list[dict], player_url: str) -> list[str]:
+    def _extract_hls(self, player_responses: list[dict], player_url: str) -> list[str]:
         """Collect HLS manifest URLs from *player_responses*, solving ``n``-challenges.
 
         For each URL containing an ``/n/<token>/`` path segment the token is
         solved via :class:`DenoSolver`. URLs whose challenge fails are dropped.
         """
         hls_list = []
-        deno = DenoSolver()
+        try:
+            slvr = DenoSolver(self.session)
+        except FileNotFoundError as e:
+            log.warning(str(e))
+            slvr = CDPSolver(self.session)
 
         for response in player_responses:
             streaming_data = response.get("streamingData")
@@ -714,7 +763,7 @@ class VideoExtractor:
             if n_matches := re.findall(r"/n/([^/]+)/", urlparse(hls_manifest_url).path):
                 n_token = n_matches[0]
                 log.debug("Solving n-challenge token: %s", n_token)
-                result = deno.solve(NChallengeInput(token=n_token, player_url=player_url))
+                result = slvr.solve(NChallengeInput(token=n_token, player_url=player_url))
 
                 if result and (solved := result.results.get(n_token)):
                     hls_manifest_url = hls_manifest_url.replace(f"/n/{n_token}", f"/n/{solved}")
@@ -1091,7 +1140,7 @@ class YouTube(Plugin):
         self.session.http.headers.update({"User-Agent": useragents.CHROME})
         res = self._get_res(self.url)
         if self.matches["channel"] and not self.match["tab"]:
-            initial = _get_data_from_regex(res, _re_ytInitialData, "initial data")
+            initial = Extractor.get_data_from_regex(res, _re_ytInitialData, "initial data")
             video_id = self._data_video_id(initial)
             if video_id is None:
                 log.error("Could not find videoId on channel page")
@@ -1110,7 +1159,7 @@ class YouTube(Plugin):
             return
 
         # the initial player response contains the category data, which the API response does not
-        init_player_response = _get_data_from_regex(res, _re_ytInitialPlayerResponse, "initial player response")
+        init_player_response = Extractor.get_data_from_regex(res, _re_ytInitialPlayerResponse, "initial player response")
         self.id, self.author, self.category, self.title, is_live = self._schema_videodetails(init_player_response)
         log.debug(f"Using video ID: {self.id}")
 
@@ -1175,7 +1224,7 @@ class YouTube(Plugin):
         with ``hls`` is reached.
         """
         if not prev_result:
-            extractor = next((e for e in self._EXTRACTORS if re.match(e.valid_url_re, self.url)), None)
+            extractor = next((e for e in self._EXTRACTORS if re.match(str(e.valid_url_re), self.url)), None)
             url = self.url
         elif prev_result.hls:
             log.debug(f"Resolved {len(prev_result.hls)} HLS manifest(s)")
@@ -1189,7 +1238,7 @@ class YouTube(Plugin):
             return []
 
         log.debug(f"Chaining to {extractor.__name__} for {url}")
-        return self._next_extract(prev_result=extractor(self.session).extract(url))
+        return self._next_extract(prev_result=extractor(self.session, self.options).extract(url))
 
     def _check_streams(self, urls: list[str]) -> list[tuple[str, HLSStream]]:
         """Parse HLS variant playlists and discard any with unreachable segments.
@@ -1214,7 +1263,8 @@ class YouTube(Plugin):
 
                 response = self.session.http.head(segment_url, raise_for_status=False)
                 if response.status_code >= 400:
-                    log.warning(f"Skipping stream with inaccessible segments: '{m3u8_url}'; status code: {response.status_code}")
+                    log.warning(
+                        f"Skipping stream with inaccessible segments: '{m3u8_url}'; status code: {response.status_code}")
                     continue
 
                 streams.extend(variant_playlist.items())

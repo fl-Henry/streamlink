@@ -20,24 +20,44 @@ log = logging.getLogger(__name__)
 
 class Deno:
     """Solves YouTube n-parameter challenges by executing JS inside Deno."""
-    def __init__(self):
+
+    _DEFAULT_PARAMS = {
+        "--ext": "js",
+        "--no-code-cache": True,
+        "--no-prompt": True,
+        "--no-remote": True,
+        "--no-lock": True,
+        "--node-modules-dir": "none",
+        "--no-config": True,
+        "--no-npm": True,
+        "--cached-only": True,
+    }
+
+    def __init__(self, params: dict | None = None):
+        """
+        Args:
+            params: Optional overrides for :attr:`_DEFAULT_PARAMS`. A value of ``True`` emits
+                    the flag alone (``--no-prompt``), a string emits ``--flag=value``, and
+                    ``False`` or ``None`` suppresses the flag entirely, which allows disabling
+                    a default (e.g. ``{"--no-remote": False}``).
+        """
         self._exec_path = resolve_executable('deno')
+        if not self._exec_path:
+            raise FileNotFoundError("Deno not found. Please install Deno from the official website")
+        self._params = {**self._DEFAULT_PARAMS, **(params or {})}
+
+    def _build_cmd(self) -> list[str]:
+        cmd = [self._exec_path, "run"]
+        for flag, value in self._params.items():
+            if value is True:
+                cmd.append(flag)
+            elif value is not False and value is not None:
+                cmd.append(f"{flag}={value}")
+        cmd.append("-")
+        return cmd
 
     def execute(self, stdin) -> str:
-        # TODO adding/editing parameters
-        cmd = [
-            self._exec_path, "run",
-            "--ext=js",
-            "--no-code-cache",
-            "--no-prompt",
-            "--no-remote",
-            "--no-lock",
-            "--node-modules-dir=none",
-            "--no-config",
-            "--no-npm",
-            "--cached-only",
-            "-",
-        ]
+        cmd = self._build_cmd()
         log.debug("Executing Deno: %s", shlex.join(cmd))
 
         proc = subprocess.Popen(
